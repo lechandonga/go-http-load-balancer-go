@@ -1,0 +1,24 @@
+{
+  "listen": ":8080",
+  "admin_path_prefix": "/admin",
+  "strategy": "round-robin",
+  "max_attempts": 3,
+  "request_timeout": "3s",
+  "total_budget": "10s",
+  "retry_status_above": 500,
+  "max_buffered_body": 1048576,
+  "health": {
+    "failure_threshold": 3,
+    "success_threshold": 2,
+    "probe_path": "/"
+  },
+  "health_timing": {
+    "probe_interval": "2s",
+    "probe_timeout": "1s"
+  },
+  "drain_timeout": "30s",
+  "backends": [
+    { "id": "svc-1", "url": "http://127.0.0.1:9001" },
+    { "id": "svc-2", "url": "http://127.0.0.1:9002" }
+  ]
+}
