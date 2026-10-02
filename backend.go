@@ -1,0 +1,125 @@
+package gateway
+
+import (
+	"net/url"
+	"sync"
+	"sync/atomic"
+)
+
+// Backend is a single upstream instance. Its health state, draining flag and
+// in-flight accounting are all safe for concurrent use.
+//
+// Lifecycle: healthy/unhealthy flips only after consecutive thresholds are
+// reached (see recordOutcome). Deregistration sets draining, which makes
+// Acquire fail immediately; the in-flight WaitGroup then drains naturally.
+type Backend struct {
+	// Name is a human-readable identifier used in logs and status output.
+	Name string
+	// URL is the base URL of the instance (scheme + host required).
+	URL *url.URL
+
+	mu         sync.Mutex
+	healthy    bool
+	draining   bool
+	consecOK   int
+	consecFail int
+
+	inflight sync.WaitGroup
+	conns    atomic.Int64
+
+	totalReqs  atomic.Int64
+	totalFails atomic.Int64
+}
+
+// NewBackend builds a Backend that starts out healthy.
+func NewBackend(name string, rawURL string) (*Backend, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return &Backend{Name: name, URL: u, healthy: true}, nil
+}
+
+// Acquire reserves an in-flight slot. It fails if the backend is draining or
+// unhealthy, guaranteeing no new traffic after deregistration starts.
+func (b *Backend) Acquire() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.draining || !b.healthy {
+		return false
+	}
+	b.inflight.Add(1)
+	b.conns.Add(1)
+	b.totalReqs.Add(1)
+	return true
+}
+
+// Release frees an in-flight slot reserved by Acquire.
+func (b *Backend) Release() {
+	b.conns.Add(-1)
+	b.inflight.Done()
+}
+
+// startDrain flips the draining flag. After this returns, no goroutine can
+// Acquire the backend, so waitDrain observes a quiescent WaitGroup.
+func (b *Backend) startDrain() {
+	b.mu.Lock()
+	b.draining = true
+	b.mu.Unlock()
+}
+
+// waitDrain blocks until all in-flight requests complete.
+func (b *Backend) waitDrain() {
+	b.inflight.Wait()
+}
+
+// Draining reports whether deregistration has begun.
+func (b *Backend) Draining() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.draining
+}
+
+// Healthy reports the current health state.
+func (b *Backend) Healthy() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.healthy
+}
+
+// InFlight returns the number of requests currently being proxied.
+func (b *Backend) InFlight() int64 {
+	return b.conns.Load()
+}
+
+// Stats returns cumulative counters for observability.
+func (b *Backend) Stats() (requests, failures int64) {
+	return b.totalReqs.Load(), b.totalFails.Load()
+}
+
+// recordOutcome feeds one observation (active probe or real request) into
+// the health state machine. It returns true only when the state flipped.
+//
+// The consecutive counters are the anti-flapping mechanism: a single
+// outlier resets the opposite counter but cannot switch the state.
+func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (changed bool, healthy bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ok {
+		b.consecOK++
+		b.consecFail = 0
+		if !b.healthy && b.consecOK >= recoveryThreshold {
+			b.healthy = true
+			return true, true
+		}
+		return false, b.healthy
+	}
+	b.consecFail++
+	b.consecOK = 0
+	b.totalFails.Add(1)
+	if b.healthy && b.consecFail >= failThreshold {
+		b.healthy = false
+		return true, false
+	}
+	return false, b.healthy
+}
