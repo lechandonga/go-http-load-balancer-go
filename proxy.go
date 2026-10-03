@@ -103,6 +103,12 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		lb.pool.metrics.noteAttempt()
+		if attempt > 0 {
+			// Every attempt beyond the first is one retry.
+			b.noteRetry()
+			lb.pool.metrics.noteRetry()
+		}
 		err := lb.proxyOnce(ctx, w, b, r, body)
 		b.Release()
 		if err == nil {
@@ -140,7 +146,9 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 		cerr := lb.classify(err, r)
 		if !errors.Is(cerr, ErrClientCanceled) {
 			// Client cancellation is not a backend failure signal.
-			recordOutcome(lb.logger, "passive", b, false, lb.cfg)
+			recordOutcome(lb.logger, lb.pool.metrics, "passive", b, false, lb.cfg)
+			b.noteFailure(cerr)
+			lb.pool.metrics.noteFailure(cerr)
 		}
 		return cerr
 	}
@@ -148,7 +156,7 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 
 	// A received response (even 5xx) is a valid answer: it is forwarded
 	// as-is, and feeds the passive health signal.
-	recordOutcome(lb.logger, "passive", b, resp.StatusCode < 500, lb.cfg)
+	recordOutcome(lb.logger, lb.pool.metrics, "passive", b, resp.StatusCode < 500, lb.cfg)
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)

@@ -12,9 +12,18 @@ import (
 type Pool struct {
 	mu       sync.RWMutex
 	backends []*Backend
+	draining map[*Backend]*drainHandle
 	rr       atomic.Uint64
 	strategy Strategy
 	logger   *slog.Logger
+	metrics  *Metrics
+}
+
+// drainHandle tracks one in-progress drain so concurrent Deregister calls
+// for the same backend join the same wait instead of draining twice.
+type drainHandle struct {
+	done chan struct{}
+	err  error
 }
 
 // NewPool creates a Pool using the given strategy.
@@ -22,31 +31,91 @@ func NewPool(strategy Strategy, logger *slog.Logger) *Pool {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Pool{strategy: strategy, logger: logger}
+	return &Pool{
+		strategy: strategy,
+		logger:   logger,
+		draining: make(map[*Backend]*drainHandle),
+		metrics:  &Metrics{},
+	}
 }
 
-// Register adds a backend so it becomes routable immediately.
-func (p *Pool) Register(b *Backend) {
+// Metrics returns the gateway-wide cumulative counters for this pool.
+func (p *Pool) Metrics() *Metrics {
+	return p.metrics
+}
+
+// Register adds a backend so it becomes routable immediately. It returns
+// ErrBackendExists if a backend with the same name or URL is registered.
+func (p *Pool) Register(b *Backend) error {
 	p.mu.Lock()
+	for _, cur := range p.backends {
+		if cur.Name == b.Name || cur.URL.String() == b.URL.String() {
+			p.mu.Unlock()
+			return ErrBackendExists
+		}
+	}
 	p.backends = append(p.backends, b)
 	p.mu.Unlock()
 	p.logger.Info("backend registered", "backend", b.Name, "url", b.URL.String())
+	return nil
+}
+
+// GetByName returns the registered (or currently draining) backend with
+// the given name, or nil.
+func (p *Pool) GetByName(name string) *Backend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, b := range p.backends {
+		if b.Name == name {
+			return b
+		}
+	}
+	for b := range p.draining {
+		if b.Name == name {
+			return b
+		}
+	}
+	return nil
 }
 
 // Deregister stops routing new requests to b, then waits for in-flight
 // requests to finish (bounded by ctx). The backend never receives new
 // traffic once Deregister has been entered.
+//
+// Concurrent Deregister calls for the same backend join the same drain and
+// observe the same result. Deregistering a backend that is not registered
+// returns ErrBackendNotFound. If the wait times out, the backend stays
+// removed from routing and the drain completes in the background; a later
+// Deregister joins that wait.
 func (p *Pool) Deregister(ctx context.Context, b *Backend) error {
-	b.startDrain()
-
 	p.mu.Lock()
+	if h, ok := p.draining[b]; ok {
+		// A drain is already in progress: join it for a consistent result.
+		p.mu.Unlock()
+		select {
+		case <-h.done:
+			return h.err
+		case <-ctx.Done():
+			return ErrDrainTimeout
+		}
+	}
+	found := false
 	for i, cur := range p.backends {
 		if cur == b {
 			p.backends = append(p.backends[:i], p.backends[i+1:]...)
+			found = true
 			break
 		}
 	}
+	if !found {
+		p.mu.Unlock()
+		return ErrBackendNotFound
+	}
+	h := &drainHandle{done: make(chan struct{})}
+	p.draining[b] = h
 	p.mu.Unlock()
+
+	b.startDrain()
 	p.logger.Info("backend deregistering, draining in-flight requests",
 		"backend", b.Name, "inflight", b.InFlight())
 
@@ -57,11 +126,28 @@ func (p *Pool) Deregister(ctx context.Context, b *Backend) error {
 	}()
 	select {
 	case <-done:
+		p.finishDrain(b, h, nil)
 		p.logger.Info("backend drained and removed", "backend", b.Name)
 		return nil
 	case <-ctx.Done():
+		// Routing has already stopped; the drain finishes in the
+		// background so late joiners still observe the final result.
+		go func() {
+			<-done
+			p.finishDrain(b, h, nil)
+			p.logger.Info("backend drained and removed", "backend", b.Name)
+		}()
 		return ErrDrainTimeout
 	}
+}
+
+// finishDrain publishes the drain result to any joined waiters.
+func (p *Pool) finishDrain(b *Backend, h *drainHandle, err error) {
+	p.mu.Lock()
+	delete(p.draining, b)
+	h.err = err
+	close(h.done)
+	p.mu.Unlock()
 }
 
 // Snapshot returns a copy of the current backend list.

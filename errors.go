@@ -21,6 +21,10 @@ var (
 	ErrClientCanceled = errors.New("client canceled request")
 	// ErrDrainTimeout means Deregister did not finish draining in time.
 	ErrDrainTimeout = errors.New("timed out waiting for backend to drain")
+	// ErrBackendNotFound means the named backend is not registered.
+	ErrBackendNotFound = errors.New("backend not found")
+	// ErrBackendExists means a backend with the same name or URL exists.
+	ErrBackendExists = errors.New("backend already registered")
 )
 
 // statusForError maps classified errors to client-visible HTTP statuses.

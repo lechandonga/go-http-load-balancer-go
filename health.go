@@ -10,9 +10,12 @@ import (
 
 // recordOutcome feeds one observation into the backend state machine and
 // logs state transitions so flips are visible in logs/metrics.
-func recordOutcome(logger *slog.Logger, source string, b *Backend, ok bool, cfg Config) {
+func recordOutcome(logger *slog.Logger, metrics *Metrics, source string, b *Backend, ok bool, cfg Config) {
 	changed, healthy := b.recordOutcome(ok, cfg.FailThreshold, cfg.RecoveryThreshold)
 	if changed {
+		if metrics != nil {
+			metrics.noteHealthFlip()
+		}
 		logger.Info("backend health state changed",
 			"backend", b.Name,
 			"healthy", healthy,
@@ -98,14 +101,14 @@ func (hc *HealthChecker) probe(b *Backend) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		recordOutcome(hc.logger, "active", b, false, hc.cfg)
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
 		return
 	}
 	resp, err := hc.client.Do(req)
 	if err != nil {
-		recordOutcome(hc.logger, "active", b, false, hc.cfg)
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
 		return
 	}
 	defer resp.Body.Close()
-	recordOutcome(hc.logger, "active", b, resp.StatusCode < 500, hc.cfg)
+	recordOutcome(hc.logger, hc.pool.metrics, "active", b, resp.StatusCode < 500, hc.cfg)
 }

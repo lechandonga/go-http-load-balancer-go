@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"errors"
+	"fmt"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -29,13 +31,22 @@ type Backend struct {
 
 	totalReqs  atomic.Int64
 	totalFails atomic.Int64
+
+	failUnreachable atomic.Int64
+	failTimeout     atomic.Int64
+	failBadResponse atomic.Int64
+	retryCount      atomic.Int64
+	healthFlips     atomic.Int64
 }
 
 // NewBackend builds a Backend that starts out healthy.
 func NewBackend(name string, rawURL string) (*Backend, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid backend URL %q: %w", rawURL, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("invalid backend URL %q: scheme must be http/https and host is required", rawURL)
 	}
 	return &Backend{Name: name, URL: u, healthy: true}, nil
 }
@@ -97,6 +108,37 @@ func (b *Backend) Stats() (requests, failures int64) {
 	return b.totalReqs.Load(), b.totalFails.Load()
 }
 
+// noteFailure records one classified forwarding failure. Client
+// cancellation never reaches this path.
+func (b *Backend) noteFailure(err error) {
+	switch {
+	case errors.Is(err, ErrBackendTimeout):
+		b.failTimeout.Add(1)
+	case errors.Is(err, ErrBadResponse):
+		b.failBadResponse.Add(1)
+	default:
+		b.failUnreachable.Add(1)
+	}
+}
+
+// noteRetry records one extra attempt (beyond the first) routed to b.
+func (b *Backend) noteRetry() {
+	b.retryCount.Add(1)
+}
+
+// Counters returns a consistent snapshot of all per-backend counters.
+func (b *Backend) Counters() BackendCounters {
+	return BackendCounters{
+		Requests:        b.totalReqs.Load(),
+		Failures:        b.totalFails.Load(),
+		FailUnreachable: b.failUnreachable.Load(),
+		FailTimeout:     b.failTimeout.Load(),
+		FailBadResponse: b.failBadResponse.Load(),
+		Retries:         b.retryCount.Load(),
+		HealthFlips:     b.healthFlips.Load(),
+	}
+}
+
 // recordOutcome feeds one observation (active probe or real request) into
 // the health state machine. It returns true only when the state flipped.
 //
@@ -110,6 +152,7 @@ func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (
 		b.consecFail = 0
 		if !b.healthy && b.consecOK >= recoveryThreshold {
 			b.healthy = true
+			b.healthFlips.Add(1)
 			return true, true
 		}
 		return false, b.healthy
@@ -119,6 +162,7 @@ func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (
 	b.totalFails.Add(1)
 	if b.healthy && b.consecFail >= failThreshold {
 		b.healthy = false
+		b.healthFlips.Add(1)
 		return true, false
 	}
 	return false, b.healthy
