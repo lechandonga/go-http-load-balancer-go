@@ -103,9 +103,17 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		err := lb.proxyOnce(ctx, w, b, r, body)
+		lb.pool.metrics.addRequest()
+		if attempt > 0 {
+			b.recordRetry()
+			lb.pool.metrics.addRetry()
+		}
+		statusCode, err := lb.proxyOnce(ctx, w, b, r, body)
 		b.Release()
 		if err == nil {
+			if statusCode >= 500 {
+				lb.recordFail(b, FailResponse5xx)
+			}
 			return
 		}
 		lastErr = err
@@ -113,6 +121,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Client is gone; nothing to write, nothing to retry.
 			return
 		}
+		lb.recordFail(b, failureClassForError(err))
 		lb.logger.Warn("attempt failed",
 			"backend", b.Name, "attempt", attempt+1,
 			"error", codeForError(err), "detail", err)
@@ -124,15 +133,23 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeError(w, lastErr)
 }
 
+// recordFail accounts one business-traffic failure on a backend and in the
+// global aggregate.
+func (lb *LoadBalancer) recordFail(b *Backend, class FailureClass) {
+	b.recordFailure(class)
+	lb.pool.metrics.addFailure(class)
+}
+
 // proxyOnce forwards the request to one backend and streams the response.
-// It returns nil once the response has been fully handed to the client.
-func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b *Backend, r *http.Request, body []byte) error {
+// It returns the upstream status code and nil once the response has been
+// fully handed to the client.
+func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b *Backend, r *http.Request, body []byte) (int, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, lb.cfg.BackendTimeout)
 	defer cancel()
 
 	outReq, err := lb.buildOutbound(attemptCtx, b, r, body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	resp, err := lb.transport.RoundTrip(outReq)
@@ -142,7 +159,7 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 			// Client cancellation is not a backend failure signal.
 			recordOutcome(lb.logger, "passive", b, false, lb.cfg)
 		}
-		return cerr
+		return 0, cerr
 	}
 	defer resp.Body.Close()
 
@@ -154,9 +171,9 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 	w.WriteHeader(resp.StatusCode)
 	_, copyErr := io.Copy(w, resp.Body)
 	if copyErr != nil && r.Context().Err() != nil {
-		return ErrClientCanceled
+		return resp.StatusCode, ErrClientCanceled
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // buildOutbound rewrites the inbound request into an upstream request.
