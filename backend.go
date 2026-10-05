@@ -35,6 +35,7 @@ type Backend struct {
 	failUnreachable atomic.Int64
 	failTimeout     atomic.Int64
 	failBadResponse atomic.Int64
+	healthFails     atomic.Int64
 	retryCount      atomic.Int64
 	healthFlips     atomic.Int64
 }
@@ -108,9 +109,10 @@ func (b *Backend) Stats() (requests, failures int64) {
 	return b.totalReqs.Load(), b.totalFails.Load()
 }
 
-// noteFailure records one classified forwarding failure. Client
-// cancellation never reaches this path.
+// noteFailure records one classified forwarding failure (transport error
+// or 5xx response). Client cancellation never reaches this path.
 func (b *Backend) noteFailure(err error) {
+	b.totalFails.Add(1)
 	switch {
 	case errors.Is(err, ErrBackendTimeout):
 		b.failTimeout.Add(1)
@@ -119,6 +121,12 @@ func (b *Backend) noteFailure(err error) {
 	default:
 		b.failUnreachable.Add(1)
 	}
+}
+
+// noteHealthFailure records one failed active health-check observation.
+// Kept separate from forwarding failures so both reconcile exactly.
+func (b *Backend) noteHealthFailure() {
+	b.healthFails.Add(1)
 }
 
 // noteRetry records one extra attempt (beyond the first) routed to b.
@@ -134,6 +142,7 @@ func (b *Backend) Counters() BackendCounters {
 		FailUnreachable: b.failUnreachable.Load(),
 		FailTimeout:     b.failTimeout.Load(),
 		FailBadResponse: b.failBadResponse.Load(),
+		HealthFailures:  b.healthFails.Load(),
 		Retries:         b.retryCount.Load(),
 		HealthFlips:     b.healthFlips.Load(),
 	}
@@ -141,6 +150,8 @@ func (b *Backend) Counters() BackendCounters {
 
 // recordOutcome feeds one observation (active probe or real request) into
 // the health state machine. It returns true only when the state flipped.
+// It only mutates health state; counters are recorded by the callers so
+// each failure observation lands in exactly one classified bucket.
 //
 // The consecutive counters are the anti-flapping mechanism: a single
 // outlier resets the opposite counter but cannot switch the state.
@@ -159,7 +170,6 @@ func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (
 	}
 	b.consecFail++
 	b.consecOK = 0
-	b.totalFails.Add(1)
 	if b.healthy && b.consecFail >= failThreshold {
 		b.healthy = false
 		b.healthFlips.Add(1)

@@ -172,6 +172,64 @@ func TestDrillErrorInjectionEvictsBackend(t *testing.T) {
 	drillControl(t, mocks[0], "/-/drill/error?enabled=false")
 }
 
+// Scenario: drill chain — while 5xx injection is active the instance stays
+// evicted across many active-probe cycles (no flapping), and only comes
+// back via the recovery threshold after the injection is cancelled.
+func TestDrillInjectedErrorStaysEvictedAcrossProbeCycles(t *testing.T) {
+	cfg := testConfig() // active probing every 20ms
+	lb, pool := newGateway(t, cfg)
+	var mocks []*MockBackend
+	for i := 1; i <= 2; i++ {
+		m, err := NewMockBackend(fmt.Sprintf("drill-%d", i), "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(m.Close)
+		mocks = append(mocks, m)
+		pool.Register(mustBackend(t, m.Name, m.URL()))
+	}
+	checker := NewHealthChecker(pool, cfg, testLogger(t))
+	checker.Start()
+	t.Cleanup(checker.Stop)
+
+	drillControl(t, mocks[0], "/-/drill/error")
+	t.Log("5xx injected into drill-1; driving traffic to cross the failure threshold")
+	for i := 0; i < 5; i++ {
+		getBody(t, lb)
+	}
+	bad := pool.GetByName("drill-1")
+	eventually(t, "drill-1 unhealthy", func() bool { return !bad.Healthy() })
+
+	t.Log("waiting across many active-probe cycles: drill-1 must stay evicted")
+	time.Sleep(30 * cfg.HealthInterval)
+	if bad.Healthy() {
+		t.Fatal("drill-1 flapped back to healthy while 5xx injection still active")
+	}
+	for i := 0; i < 6; i++ {
+		code, body := getBody(t, lb)
+		if code != http.StatusOK || !strings.Contains(body, "drill-2") {
+			t.Fatalf("traffic not rerouted after probe cycles: got %d %q", code, body)
+		}
+	}
+	if bad.Healthy() {
+		t.Fatal("drill-1 recovered while still returning 500")
+	}
+	t.Log("injection active: drill-1 stayed unhealthy, all traffic on drill-2: OK")
+
+	drillControl(t, mocks[0], "/-/drill/error?enabled=false")
+	t.Log("injection cancelled; waiting for recovery threshold via active probes")
+	eventually(t, "drill-1 healthy again", bad.Healthy)
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		_, body := getBody(t, lb)
+		seen[strings.TrimSpace(strings.Split(body, " ")[2])] = true
+	}
+	if !seen["drill-1"] {
+		t.Fatalf("recovered drill-1 not back in rotation: %v", seen)
+	}
+	t.Log("after cancelling injection, drill-1 recovered and rejoined rotation: OK")
+}
+
 // Scenario: drill chain — hang triggers the distinguishable timeout error.
 func TestDrillHangTriggersTimeout(t *testing.T) {
 	cfg := testConfig()

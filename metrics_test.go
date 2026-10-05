@@ -52,7 +52,8 @@ func TestMetricsFailureClassification(t *testing.T) {
 	}))
 	t.Cleanup(slow.Close)
 
-	// bad response: sends half a status line then drops the connection
+	// bad response: reads the request, sends half a status line, then drops
+	// the connection (reading first keeps the classification deterministic)
 	truncatedLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +66,16 @@ func TestMetricsFailureClassification(t *testing.T) {
 				return
 			}
 			go func() {
+				// Drain the request headers (until a blank line) so the
+				// client has fully sent its request before we truncate.
+				buf := make([]byte, 1)
+				var window [4]byte
+				for string(window[:]) != "\r\n\r\n" {
+					if _, err := conn.Read(buf); err != nil {
+						return
+					}
+					copy(window[:], append(window[1:], buf[0]))
+				}
 				conn.Write([]byte("HTTP/1.1 200 O")) // partial status line, then drop
 				conn.Close()
 			}()
@@ -287,4 +298,161 @@ func TestMetricsConsistencyUnderConcurrency(t *testing.T) {
 	}
 	t.Logf("after %d concurrent requests: totals match per-backend sums and actual hits: OK",
 		totalRequests)
+}
+
+// assertReconciled checks the reconciliation invariants scripts rely on:
+// total == sum(backends) + removed for every counter, and each backend's
+// failures equal the sum of its own classified counters.
+func assertReconciled(t *testing.T, st PoolStatus) {
+	t.Helper()
+	var sum BackendCounters
+	for _, b := range st.Backends {
+		if b.Failures != b.FailUnreachable+b.FailTimeout+b.FailBadResponse {
+			t.Fatalf("backend %s: failures %d != classified sum %d",
+				b.Name, b.Failures, b.FailUnreachable+b.FailTimeout+b.FailBadResponse)
+		}
+		sum.add(BackendCounters{
+			Requests:        b.Requests,
+			Failures:        b.Failures,
+			FailUnreachable: b.FailUnreachable,
+			FailTimeout:     b.FailTimeout,
+			FailBadResponse: b.FailBadResponse,
+			HealthFailures:  b.HealthFailures,
+			Retries:         b.Retries,
+			HealthFlips:     b.HealthFlips,
+		})
+	}
+	sum.add(st.Removed)
+	if sum != st.Total {
+		t.Fatalf("global total does not reconcile: total=%+v, sum(backends)+removed=%+v",
+			st.Total, sum)
+	}
+}
+
+// Scenario: only background health checks run (backend down, zero business
+// traffic). The failed probe observations land in the dedicated
+// health_failures counter — per backend and globally — while every
+// forwarding counter stays at zero and the books reconcile.
+func TestMetricsHealthCheckFailuresReconciled(t *testing.T) {
+	cfg := testConfig()
+	_, pool := newGateway(t, cfg)
+	b := mustBackend(t, "down", deadBackendURL(t))
+	pool.Register(b)
+
+	checker := NewHealthChecker(pool, cfg, testLogger(t))
+	checker.Start()
+
+	eventually(t, "probe failures observed", func() bool {
+		return b.Counters().HealthFailures >= 3
+	})
+	eventually(t, "backend marked unhealthy by probes", func() bool { return !b.Healthy() })
+	checker.Stop() // quiesce probes so the status read is a consistent snapshot
+
+	st := statusJSON(t, pool)
+	down := findBackend(t, st, "down")
+	if down.Requests != 0 || down.Failures != 0 {
+		t.Fatalf("background probes leaked into forwarding counters: %+v", down)
+	}
+	if down.HealthFailures == 0 || st.Total.HealthFailures != down.HealthFailures {
+		t.Fatalf("probe failures missing from health_failures: backend=%d total=%d",
+			down.HealthFailures, st.Total.HealthFailures)
+	}
+	assertReconciled(t, st)
+	t.Logf("no business traffic: failures=0, health_failures=%d reconciled globally: OK",
+		down.HealthFailures)
+}
+
+// Scenario: full reconciliation under concurrency — 5xx-injected backend,
+// healthy backend, active probing, client cancellations and admin traffic
+// all at once. Every counter must reconcile exactly afterwards.
+func TestMetricsReconciliationUnderConcurrency(t *testing.T) {
+	var goodHits, badHits atomic.Int64
+	// Probes share the test servers; only count business traffic (non-probe).
+	countHit := func(c *atomic.Int64, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			c.Add(1)
+		}
+	}
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countHit(&goodHits, r)
+	}))
+	t.Cleanup(good.Close)
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countHit(&badHits, r)
+		w.WriteHeader(http.StatusInternalServerError) // like an injected 5xx
+	}))
+	t.Cleanup(bad.Close)
+
+	cfg := testConfig()
+	lb, pool, admin := newAdmin(t, cfg)
+	pool.Register(mustBackend(t, "good", good.URL))
+	pool.Register(mustBackend(t, "bad", bad.URL))
+	checker := NewHealthChecker(pool, cfg, testLogger(t))
+	checker.Start()
+
+	const workers, perWorker = 12, 20
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				doRequest(t, lb, http.MethodGet, "http://gw/")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Admin traffic must not mix into business metrics.
+	adminReqsBefore := pool.Metrics().Snapshot().Requests
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/-/admin/backends", nil)
+		rec := httptest.NewRecorder()
+		admin.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("admin list got %d", rec.Code)
+		}
+	}
+	if got := pool.Metrics().Snapshot().Requests - adminReqsBefore; got != 0 {
+		t.Fatalf("admin traffic leaked into business metrics: %d extra requests", got)
+	}
+
+	// Client cancellations are not backend failures.
+	failBefore := pool.Metrics().Snapshot().Failures
+	for i := 0; i < 5; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodGet, "http://gw/", nil).WithContext(ctx)
+		lb.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if got := pool.Metrics().Snapshot().Failures; got != failBefore {
+		t.Fatalf("client cancel counted as failure: %d -> %d", failBefore, got)
+	}
+
+	eventually(t, "probe failures on 5xx backend counted", func() bool {
+		return pool.Metrics().Snapshot().HealthFailures > 0
+	})
+	checker.Stop() // quiesce probes so the status read is a consistent snapshot
+
+	st := statusJSON(t, pool)
+	assertReconciled(t, st)
+
+	goodSt := findBackend(t, st, "good")
+	badSt := findBackend(t, st, "bad")
+	// Canceled requests count as attempts (they were routed) but never
+	// reach an upstream, so requests == upstream hits + canceled attempts.
+	const canceled = 5
+	if got := goodSt.Requests - goodHits.Load() + badSt.Requests - badHits.Load(); got != canceled {
+		t.Fatalf("attempt/upstream mismatch: unrouted attempts = %d, want %d (canceled)",
+			got, canceled)
+	}
+	if badSt.FailBadResponse != badHits.Load() || badSt.Failures != badHits.Load() {
+		t.Fatalf("5xx responses not classified as bad_response: %+v (hits=%d)",
+			badSt, badHits.Load())
+	}
+	if goodSt.Failures != 0 {
+		t.Fatalf("healthy backend accrued failures: %+v", goodSt)
+	}
+	t.Logf("reconciled under concurrency: requests=%d failures=%d health_failures=%d retries=%d",
+		st.Total.Requests, st.Total.Failures, st.Total.HealthFailures, st.Total.Retries)
 }

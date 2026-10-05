@@ -101,14 +101,27 @@ func (hc *HealthChecker) probe(b *Backend) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
+		hc.noteProbeFailure(b)
 		return
 	}
 	resp, err := hc.client.Do(req)
 	if err != nil {
-		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
+		hc.noteProbeFailure(b)
 		return
 	}
 	defer resp.Body.Close()
-	recordOutcome(hc.logger, hc.pool.metrics, "active", b, resp.StatusCode < 500, hc.cfg)
+	if resp.StatusCode < 500 {
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, true, hc.cfg)
+		return
+	}
+	hc.noteProbeFailure(b)
+}
+
+// noteProbeFailure records a failed active health check in the dedicated
+// health_failures counter (per backend and global) and feeds the health
+// state machine. Probe failures never pollute the forwarding counters.
+func (hc *HealthChecker) noteProbeFailure(b *Backend) {
+	b.noteHealthFailure()
+	hc.pool.metrics.noteHealthFailure()
+	recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
 }

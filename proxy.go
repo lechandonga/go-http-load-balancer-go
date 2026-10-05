@@ -155,8 +155,14 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 	defer resp.Body.Close()
 
 	// A received response (even 5xx) is a valid answer: it is forwarded
-	// as-is, and feeds the passive health signal.
+	// as-is, and feeds the passive health signal. A 5xx also counts as a
+	// classified forwarding failure (bad_response) so per-backend and
+	// global failure counters reconcile with what actually happened.
 	recordOutcome(lb.logger, lb.pool.metrics, "passive", b, resp.StatusCode < 500, lb.cfg)
+	if resp.StatusCode >= 500 {
+		b.noteFailure(ErrBadResponse)
+		lb.pool.metrics.noteFailure(ErrBadResponse)
+	}
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)

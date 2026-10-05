@@ -13,6 +13,7 @@ type Pool struct {
 	mu       sync.RWMutex
 	backends []*Backend
 	draining map[*Backend]*drainHandle
+	removed  BackendCounters
 	rr       atomic.Uint64
 	strategy Strategy
 	logger   *slog.Logger
@@ -45,17 +46,23 @@ func (p *Pool) Metrics() *Metrics {
 }
 
 // Register adds a backend so it becomes routable immediately. It returns
-// ErrBackendExists if a backend with the same name or URL is registered.
+// ErrBackendExists if a backend with the same name or URL is registered
+// or still draining: until a drain fully completes, the name and URL stay
+// reserved so no duplicate instance can appear in the pool.
 func (p *Pool) Register(b *Backend) error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	for _, cur := range p.backends {
 		if cur.Name == b.Name || cur.URL.String() == b.URL.String() {
-			p.mu.Unlock()
+			return ErrBackendExists
+		}
+	}
+	for cur := range p.draining {
+		if cur.Name == b.Name || cur.URL.String() == b.URL.String() {
 			return ErrBackendExists
 		}
 	}
 	p.backends = append(p.backends, b)
-	p.mu.Unlock()
 	p.logger.Info("backend registered", "backend", b.Name, "url", b.URL.String())
 	return nil
 }
@@ -141,13 +148,24 @@ func (p *Pool) Deregister(ctx context.Context, b *Backend) error {
 	}
 }
 
-// finishDrain publishes the drain result to any joined waiters.
+// finishDrain publishes the drain result to any joined waiters and folds
+// the backend's final counters into the removed aggregate, so the global
+// total always equals the sum of registered backends plus removed ones.
 func (p *Pool) finishDrain(b *Backend, h *drainHandle, err error) {
 	p.mu.Lock()
 	delete(p.draining, b)
+	p.removed.add(b.Counters())
 	h.err = err
 	close(h.done)
 	p.mu.Unlock()
+}
+
+// removedCounters returns the cumulative counters of fully drained
+// backends.
+func (p *Pool) removedCounters() BackendCounters {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.removed
 }
 
 // Snapshot returns a copy of the current backend list.

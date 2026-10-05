@@ -17,15 +17,19 @@ type BackendStatus struct {
 	FailUnreachable int64  `json:"fail_unreachable"`
 	FailTimeout     int64  `json:"fail_timeout"`
 	FailBadResponse int64  `json:"fail_bad_response"`
+	HealthFailures  int64  `json:"health_failures"`
 	Retries         int64  `json:"retries"`
 	HealthFlips     int64  `json:"health_flips"`
 }
 
 // PoolStatus is the top-level status document: per-backend detail plus a
-// gateway-wide cumulative total (including deregistered backends).
+// gateway-wide cumulative total (including deregistered backends) and the
+// aggregate counters of fully drained backends, so scripts can reconcile:
+// total == sum(backends) + removed, for every counter.
 type PoolStatus struct {
 	Backends []BackendStatus `json:"backends"`
 	Total    BackendCounters `json:"total"`
+	Removed  BackendCounters `json:"removed"`
 }
 
 func statusOf(b *Backend) BackendStatus {
@@ -41,6 +45,7 @@ func statusOf(b *Backend) BackendStatus {
 		FailUnreachable: c.FailUnreachable,
 		FailTimeout:     c.FailTimeout,
 		FailBadResponse: c.FailBadResponse,
+		HealthFailures:  c.HealthFailures,
 		Retries:         c.Retries,
 		HealthFlips:     c.HealthFlips,
 	}
@@ -60,6 +65,7 @@ func (p *Pool) StatusHandler() http.Handler {
 		_ = json.NewEncoder(w).Encode(PoolStatus{
 			Backends: out,
 			Total:    p.metrics.Snapshot(),
+			Removed:  p.removedCounters(),
 		})
 	})
 }

@@ -338,3 +338,87 @@ func TestAdminTrafficNotCounted(t *testing.T) {
 	}
 	t.Log("admin requests never touch forwarding metrics: OK")
 }
+
+// Scenario: re-registering the same name/URL while a drain is still in
+// progress is rejected with a consistent 409, no duplicate instance ever
+// appears, and a by-name deregister joins the ongoing drain instead of
+// reporting "drained" while the old in-flight request is still running.
+func TestAdminReregisterDuringDrainRejected(t *testing.T) {
+	release := make(chan struct{})
+	var relOnce sync.Once
+	rel := func() { relOnce.Do(func() { close(release) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		fmt.Fprintln(w, "done")
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(rel)
+
+	lb, pool, admin := newAdmin(t, testConfig())
+	pool.Register(mustBackend(t, "slow", srv.URL))
+
+	respCh := make(chan int, 1)
+	go func() {
+		rec := doRequest(t, lb, http.MethodGet, "http://gw/")
+		respCh <- rec.Code
+	}()
+	eventually(t, "slow request in flight", func() bool {
+		return pool.GetByName("slow").InFlight() == 1
+	})
+
+	t.Log("deregister with short timeout: drain starts but cannot finish yet")
+	code, body := adminDo(t, admin, http.MethodDelete,
+		"/-/admin/backends/slow?timeout=50ms", "")
+	if code != http.StatusGatewayTimeout || body["error"] != "drain_timeout" {
+		t.Fatalf("got %d (%v), want 504 drain_timeout", code, body)
+	}
+
+	t.Log("while draining: same name/URL registrations must be rejected")
+	for _, dup := range []string{
+		fmt.Sprintf(`{"name":"slow","url":%q}`, srv.URL),  // same name + url
+		`{"name":"slow","url":"http://127.0.0.1:9"}`,      // same name
+		fmt.Sprintf(`{"name":"slow2","url":%q}`, srv.URL), // same url
+	} {
+		code, body = adminDo(t, admin, http.MethodPost, "/-/admin/backends", dup)
+		if code != http.StatusConflict || body["error"] != "duplicate_backend" {
+			t.Fatalf("register %s during drain: got %d (%v), want 409 duplicate_backend",
+				dup, code, body)
+		}
+	}
+	if n := len(pool.Snapshot()); n != 0 {
+		t.Fatalf("duplicate instance appeared in pool during drain: %d backends", n)
+	}
+	t.Log("all duplicate registrations rejected with 409, pool has no duplicates: OK")
+
+	t.Log("second DELETE by name joins the ongoing drain and must not report drained early")
+	drainCh := make(chan int, 1)
+	go func() {
+		code, _ := adminDo(t, admin, http.MethodDelete, "/-/admin/backends/slow", "")
+		drainCh <- code
+	}()
+	select {
+	case code := <-drainCh:
+		t.Fatalf("second DELETE returned %d while the old in-flight request is still running", code)
+	case <-time.After(100 * time.Millisecond):
+		t.Log("second DELETE still waiting for the old in-flight request: OK")
+	}
+
+	rel()
+	if code := <-respCh; code != http.StatusOK {
+		t.Fatalf("in-flight request lost: got %d", code)
+	}
+	if code := <-drainCh; code != http.StatusOK {
+		t.Fatalf("second DELETE got %d, want 200 after the old request finished", code)
+	}
+	t.Log("old in-flight request finished; only then did DELETE report drained: OK")
+
+	code, _ = adminDo(t, admin, http.MethodPost, "/-/admin/backends",
+		fmt.Sprintf(`{"name":"slow","url":%q}`, srv.URL))
+	if code != http.StatusCreated {
+		t.Fatalf("re-register after drain completed: got %d, want 201", code)
+	}
+	if n := len(pool.Snapshot()); n != 1 {
+		t.Fatalf("pool size = %d, want exactly 1 after re-register", n)
+	}
+	t.Log("after drain completed, same name/URL registers cleanly: 201")
+}

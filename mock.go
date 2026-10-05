@@ -12,7 +12,7 @@ import (
 // MockBackend is a controllable fake upstream used by drill mode and
 // tests. Its behavior can be switched at runtime over HTTP:
 //
-//	POST /-/drill/error?enabled=true|false   always answer 500
+//	POST /-/drill/error?enabled=true|false   always answer 500 (health endpoint included)
 //	POST /-/drill/hang?d=300ms               hang every request for d (0 clears)
 //	POST /-/drill/down                       go offline (health + traffic fail)
 //	POST /-/drill/up                         come back online
@@ -118,6 +118,14 @@ func (m *MockBackend) handleUp(w http.ResponseWriter, r *http.Request) {
 func (m *MockBackend) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if !m.up.Load() {
 		http.Error(w, "down", http.StatusServiceUnavailable)
+		return
+	}
+	if m.injectErr.Load() {
+		// Error injection means the instance is broken as a whole: the
+		// health endpoint fails too, so active probes agree with passive
+		// results and the gateway keeps it evicted until injection is
+		// cancelled.
+		http.Error(w, "injected error", http.StatusInternalServerError)
 		return
 	}
 	fmt.Fprintln(w, "ok")
