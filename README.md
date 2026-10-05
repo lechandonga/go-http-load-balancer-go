@@ -43,6 +43,15 @@ cmd/demo-backend/  演示后端（可切换健康、可注入延迟）
 
 被动判定规则：传输层错误（不可达/超时/异常响应）记失败；收到响应时状态码 < 500 记成功，≥ 500 记失败（响应本身仍原样转发给客户端）。客户端取消不计为后端失败。
 
+### 5xx 演练注入期间的语义（重要）
+
+演练模式对模拟实例 `POST /-/drill/error` 表示**整个实例**处于故障态：注入期间它不仅对业务请求返回 500，其主动健康检查端点 `/healthz` 同样返回 500。因此：
+
+- 注入未取消、实例持续返回 5xx 期间，主动探测也一直失败，实例会**一直保持 unhealthy、流量持续绕开**，不会出现"摘除—几秒后又被判回健康"的翻转；
+- 只有 `?enabled=false` 取消注入后，`/healthz` 才恢复正常，实例再按 `RecoveryThreshold`（连续成功次数）正常重新接入；
+- 状态翻转只可能由"连续失败达阈值 / 连续成功达阈值"引起，注入期间 `health_flips` 保持为摘除时的那一次；
+- 挂起（`/-/drill/hang`，仅业务请求挂起、健康检查正常）与整体下线/上线（`/-/drill/down|up`）的可区分行为不变：挂起仍只触发可区分的超时分类，下线则健康检查与业务流量同时失败、上线后按恢复阈值回来。
+
 ## 失败与重试语义
 
 失败分类（客户端收到 `X-Lb-Error` 头 + JSON 错误体，底层错误只进日志、不外泄）：
@@ -93,12 +102,20 @@ cmd/demo-backend/  演示后端（可切换健康、可注入延迟）
 | --- | --- | --- |
 | 注册成功 | 201 | 实例状态 JSON |
 | URL 非法 / body 非法 | 400 | `{"error":"invalid_backend_url" / "invalid_request"}` |
-| name 或 url 重复 | 409 | `{"error":"duplicate_backend"}` |
+| name 或 url 与在册实例重复 | 409 | `{"error":"duplicate_backend"}` |
+| 同名或同址实例仍在排空中（在途请求尚未收尾） | 409 | `{"error":"duplicate_backend","detail":"... already registered or still draining ..."}` |
 | 摘除成功（排空完成） | 200 | `{"status":"drained","name":"..."}` |
 | 实例不存在（含排空完成后重复摘除） | 404 | `{"error":"backend_not_found"}` |
 | 排空等待超时（实例已停止接新流量，在途请求不丢，后台继续排空） | 504 | `{"error":"drain_timeout"}` |
 
 并发摘除同一实例会汇入同一次排空，结果一致，不会重复排空或丢在途请求。
+
+排空期间重复注册的语义（防止"旧实例还在收尾、同名新实例已进池"）：
+
+- 摘除一旦开始，该实例的 **name 与 url 都被占用**，直到在途请求全部收尾、排空真正完成；期间任何同名或同址的 `POST /backends` 一律稳定返回 **409 `duplicate_backend`**（同名不同址、同址不同名都拒绝），池子里不会出现第二个同名或同址实例；
+- 排空超时（504）只是"等待"超时，路由早已停止、后台仍在收尾；这段时间同样拒绝重复注册，等后台排空完成后才允许重新注册；
+- 排空中再次按名字 `DELETE` 不会摘到任何新实例，而是**汇入旧实例那次排空**，必须等旧的在途请求真正收尾后才返回 200，不会在慢请求仍在跑时误报已排空；
+- 只有排空彻底完成后，同名/同址才能重新注册（返回 201），注册成功后立即再注册一次仍会因重复被 409 拒绝。
 
 ## 指标与状态输出
 
@@ -109,7 +126,7 @@ cmd/demo-backend/  演示后端（可切换健康、可注入延迟）
   "backends": [
     {
       "name": "drill-1", "url": "http://127.0.0.1:19001",
-      "healthy": true, "draining": false, "in_flight": 0,
+      "healthy": true, "draining": false, "retired": false, "in_flight": 0,
       "requests": 4, "failures": 0,
       "fail_unreachable": 0, "fail_timeout": 0, "fail_bad_response": 0,
       "retries": 0, "health_flips": 1
@@ -125,13 +142,25 @@ cmd/demo-backend/  演示后端（可切换健康、可注入延迟）
 
 字段口径：
 
-- `requests`：转发到该实例的尝试次数（含重试）；`total.requests` 为全局尝试总数，恒等于各实例之和；
-- `failures`：进入健康状态机的失败观测数（含主动探测）；
-- `fail_unreachable` / `fail_timeout` / `fail_bad_response`：**仅转发失败**的分类计数（连不上 / 超时 / 响应异常），与实际转发一一对应；
+- `requests`：转发到该实例的尝试次数（含重试，不含主动健康检查）；`total.requests` 为全局尝试总数；
+- `failures`：进入健康状态机的失败观测总数，**既包括业务转发失败也包括主动探测失败**；
+- `fail_unreachable` / `fail_timeout` / `fail_bad_response`：失败观测的三类计数，每个失败观测恰好落入其中一类——连不上（dial/connection 失败）/ 超时（deadline、读超时、主动探测超时）/ 响应异常（收到 5xx、响应头或响应体非法/截断）。主动探测失败也有稳定去处：探测 5xx/异常归入 `fail_bad_response`，探测超时归入 `fail_timeout`，探测连不上归入 `fail_unreachable`；
+- 每个实例恒有 `failures == fail_unreachable + fail_timeout + fail_bad_response`，全局亦然；
 - `retries`：额外尝试次数（首次尝试不算重试）；
 - `health_flips`：healthy↔unhealthy 翻转次数；
-- `total`：网关级累计汇总，**包含已摘除实例**，单调不减；
+- `draining`：正在摘除排空中（已不接新流量、在途请求收尾中）；`retired`：排空已彻底完成、永不再路由，但其最终计数仍保留在文档里；
+- 状态文档列出**在路由、排空中、已摘除（retired）**三类实例；`total` 是网关级累计汇总，单调不减，且**恒等于文档中所有实例（含 retired）各字段之和**——脚本可直接用 `backends` 求和与 `total` 对账；
+- 业务转发次数与失败次数与实际发生一一对应：实例 `requests` 等于真正派发到它的尝试数；5xx/截断等失败响应即使原样转发（客户端可能已先收到 200 状态行），也仍是一条失败观测，计入 `failures` 与 `fail_bad_response`；
 - 客户端主动取消不算后端失败，管理面请求不进入任何计数。
+
+对账方法（照着敲，用 `jq`）：
+
+```bash
+s=$(curl -s localhost:8080/-/status)
+echo "$s" | jq '.backends | map(.failures) | add == (.total.failures)'          # true
+echo "$s" | jq '.backends | all(.failures == .fail_unreachable + .fail_timeout + .fail_bad_response)'  # true
+echo "$s" | jq -e '.total == (.backends | map({requests: .requests, failures: .failures, fail_unreachable: .fail_unreachable, fail_timeout: .fail_timeout, fail_bad_response: .fail_bad_response, retries: .retries, health_flips: .health_flips}) | add // {requests:0,failures:0,fail_unreachable:0,fail_timeout:0,fail_bad_response:0,retries:0,health_flips:0})' >/dev/null && echo totals-match
+```
 
 ## 本地启动与验证
 
@@ -177,7 +206,11 @@ curl -XPOST localhost:19001/-/drill/error
 for i in $(seq 1 9); do curl -s -o /dev/null localhost:8080/; done
 curl -s localhost:8080/-/status                            # drill-1 healthy=false, health_flips=1
 curl -s localhost:8080/                                    # 只返回 drill-2 / drill-3
-#    （drill-1 的 /healthz 仍正常，主动探测随后会把它标回健康，属预期行为）
+# 等若干个健康检查周期（默认 2s，可等 10s 以上），drill-1 仍然 healthy=false，
+# 业务请求持续只落 drill-2/drill-3；/healthz 在注入期间同样返回 500，不会被探测复活
+curl -s localhost:8080/-/status | jq '.backends[] | select(.name=="drill-1") | {healthy,health_flips,fail_bad_response}'
+curl -XPOST localhost:19001/-/drill/error?enabled=false    # 取消注入
+sleep 5                                                    # 连续探测成功达到恢复阈值后重新接入
 
 # 3. 运行期摘除 drill-1 / drill-3，只留 drill-2
 curl -XDELETE localhost:8080/-/admin/backends/drill-1      # {"status":"drained",...}
@@ -203,6 +236,114 @@ time curl -s -D- -o /dev/null localhost:8080/              # 立即 503, X-Lb-Er
 
 # Ctrl-C 干净退出（网关与所有模拟后端一起关闭）
 ```
+
+## 三块修复的复现验证流程
+
+先起演练网关：
+
+```bash
+go run ./cmd/gateway -addr :8080 -drill -drill-backends 3 -drill-port-base 19001
+```
+
+### 1. 5xx 注入后持续摘除、流量持续绕开
+
+```bash
+curl -XPOST localhost:19001/-/drill/error                     # 对 drill-1 注入 500
+for i in $(seq 1 9); do curl -s -o /dev/null localhost:8080/; done   # 触发失败阈值
+curl -s localhost:8080/-/status | jq '.backends[] | select(.name=="drill-1") | .healthy'  # false
+# 跑过 5 个以上健康检查周期（默认 2s/次），期间持续打业务请求：
+sleep 10
+for i in $(seq 1 12); do curl -s localhost:8080/; done         # 全部来自 drill-2/drill-3，无 drill-1
+curl -s localhost:8080/-/status | jq '.backends[] | select(.name=="drill-1") | {healthy,health_flips}'
+#   → {"healthy":false,"health_flips":1}：注入期间不翻转、不复活
+curl -XPOST 'localhost:19001/-/drill/error?enabled=false'      # 取消注入
+sleep 5
+curl -s localhost:8080/-/status | jq '.backends[] | select(.name=="drill-1") | .healthy'  # true：按恢复阈值回来
+```
+
+### 2. 指标对账（业务、后台探测、并发、取消与管理面隔离）
+
+```bash
+# 2.1 业务 + 5xx 注入后，全局汇总等于各实例之和、实例失败数等于分类之和
+curl -XPOST localhost:19001/-/drill/error
+for i in $(seq 1 20); do curl -s -o /dev/null localhost:8080/; done
+s=$(curl -s localhost:8080/-/status)
+echo "$s" | jq '.backends | all(.failures == .fail_unreachable + .fail_timeout + .fail_bad_response)'  # true
+echo "$s" | jq '.total.failures == ([.backends[].failures] | add)'                                     # true
+
+# 2.2 只让后台健康检查跑、无任何业务请求：把一个实例整体下线
+curl -XPOST 'localhost:19001/-/drill/error?enabled=false'      # 先清掉 5xx 注入
+curl -XPOST localhost:19002/-/drill/down
+sleep 3                                                        # 只有主动探测在跑
+s=$(curl -s localhost:8080/-/status)
+echo "$s" | jq '.backends[] | select(.name=="drill-2") | {requests,failures,fail_bad_response}'
+#   → requests=0，failures>0 且全部落在 fail_bad_response（探测 503）；total 与实例数相等
+echo "$s" | jq '.total.failures == ([.backends[].failures] | add)'                                    # true
+curl -XPOST localhost:19002/-/drill/up
+
+# 2.3 管理面流量不混入业务指标
+before=$(curl -s localhost:8080/-/status | jq -c .total)
+for i in $(seq 1 10); do curl -s -o /dev/null localhost:8080/-/admin/backends; done
+after=$(curl -s localhost:8080/-/status | jq -c .total)
+[ "$before" = "$after" ] && echo admin-not-counted
+
+# 2.4 全字段对账（含已摘除实例 retired）
+curl -s -XDELETE localhost:8080/-/admin/backends/drill-3
+curl -s localhost:8080/-/status | jq -e '
+  .total == (.backends | map({requests,failures,fail_unreachable,fail_timeout,fail_bad_response,retries,health_flips})
+             | add // {requests:0,failures:0,fail_unreachable:0,fail_timeout:0,fail_bad_response:0,retries:0,health_flips:0})' \
+  >/dev/null && echo totals-match
+```
+
+（客户端取消不计失败由自动化用例 `TestMetricsClientCancelNotCounted` 与 `TestMetricsReconciliationUnderConcurrency` 覆盖；并发压测下的不丢计数、对账一致由后者保证。）
+
+### 3. 排空期间重复注册被拒、按名摘除不误报排空
+
+为让慢请求在网关侧稳定保持在途（不被重试/超时干扰），用一个独立的**单后端**演练网关（端口与第 1、2 节的网关不冲突）。需要两个终端。终端 A：
+
+```bash
+go run ./cmd/gateway -addr :8081 -drill -drill-backends 1 -drill-port-base 19101 -max-retries 0 -drain-timeout 30s
+```
+
+终端 B（挂起 3s——小于默认 5s 后端超时，慢请求会真实在途；发出后立即摘除）：
+
+```bash
+curl -XPOST 'localhost:19101/-/drill/hang?d=3s'
+curl -s localhost:8081/ -o /tmp/slow.out &
+sleep 0.5
+curl -s localhost:8081/-/status | jq '.backends[0].in_flight'           # 1，慢请求在途
+
+# 摘除 drill-1：只等 1s，在途还没收尾，返回 504 drain_timeout
+curl -s -w '\nHTTP %{http_code}\n' -XDELETE 'localhost:8081/-/admin/backends/drill-1?timeout=1s'
+
+# 旧实例还在收尾：同名/同址注册一律 409，不产生重复实例
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8081/-/admin/backends \
+  -d '{"name":"drill-1","url":"http://127.0.0.1:19101"}'                 # 409
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8081/-/admin/backends \
+  -d '{"name":"drill-1","url":"http://127.0.0.1:1"}'                     # 409（同名不同址）
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8081/-/admin/backends \
+  -d '{"name":"other","url":"http://127.0.0.1:19101"}'                   # 409（同址不同名）
+curl -s localhost:8081/-/admin/backends | jq '[.[].name]'                # []，在路由表无重复
+curl -s localhost:8081/-/status | jq '[.backends[] | select(.name=="drill-1")] | length'  # 1（仅排空中那一个）
+
+# 再按名摘除：汇入旧排空，必须等在途请求收尾（约再等 2s）才回 200，不会立刻误报 drained
+time curl -s -XDELETE localhost:8081/-/admin/backends/drill-1
+
+# 排空彻底完成后才能重新注册
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8081/-/admin/backends \
+  -d '{"name":"drill-1","url":"http://127.0.0.1:19101"}'                 # 201
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8081/-/admin/backends \
+  -d '{"name":"drill-1","url":"http://127.0.0.1:19101"}'                 # 409（重复）
+```
+
+终端 A 收尾：
+
+```bash
+curl -XPOST 'localhost:19101/-/drill/hang?d=0s'
+# Ctrl-C 停掉 :8081 网关
+```
+
+---
 
 ## 启动参数一览
 
@@ -234,3 +375,11 @@ CGO_ENABLED=1 go test -race -v ./...
 - `TestConcurrentDeregisterSameBackend` / `TestAdminDeregisterUnderTraffic` / `TestAdminTrafficNotCounted`：并发摘除结果一致、业务流量叠加管理操作不丢请求、管理流量不进指标；
 - `TestMetricsFailureClassification` / `TestMetricsRetryCounting` / `TestMetricsClientCancelNotCounted` / `TestMetricsHealthFlips` / `TestMetricsConsistencyUnderConcurrency`：失败分类、重试计数、取消不计失败、翻转计数、并发下全局与实例计数一致；
 - `TestMockBackendControl` / `TestDrill*`：演练后端的现场控制与完整链路（轮询、5xx 摘除、挂起超时、全下线快速失败、慢请求中摘除）。
+
+本轮修复新增的覆盖：
+
+- `TestInjected5xxStaysEvictedAcrossProbeRounds`：5xx 注入后跨 20+ 个主动探测周期仍保持摘除、业务流量持续绕开，取消注入后才按恢复阈值重新接入；
+- `TestMetricsReconciliationUnderConcurrency`：12 路并发业务压力 + 客户端取消 + 管理面流量交织下，全局 total 与所有实例（含已摘除）逐字段求和相等、实例失败数等于自身三类之和、计数与真实命中一一对应、取消与管理面不入账；
+- `TestActiveProbeFailuresReconcileWithoutTraffic`：实例整体下线、只有后台健康检查在跑、零业务请求时，探测失败有稳定分类（`fail_bad_response`）且全局与实例对账相等；
+- `TestDrainRejectsDuplicateUntilInFlightFinished`：慢请求在途时摘除，同名/同址/同名不同址/同址不同名注册全部 409 且不产生重复实例，第二次按名摘除汇入旧排空、在途未收尾时不误报已排空，排空完成后才允许重新注册；
+- `TestDrainTimeoutStillRejectsDuplicateRegistration`：排空 504 超时后的后台收尾期同样拒绝重复注册，收尾完成后才接受。

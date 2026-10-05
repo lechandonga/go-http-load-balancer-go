@@ -13,6 +13,7 @@ type Pool struct {
 	mu       sync.RWMutex
 	backends []*Backend
 	draining map[*Backend]*drainHandle
+	retired  []*Backend
 	rr       atomic.Uint64
 	strategy Strategy
 	logger   *slog.Logger
@@ -45,10 +46,21 @@ func (p *Pool) Metrics() *Metrics {
 }
 
 // Register adds a backend so it becomes routable immediately. It returns
-// ErrBackendExists if a backend with the same name or URL is registered.
+// ErrBackendExists if a backend with the same name or URL is registered,
+// including a backend that is currently draining: its identity stays
+// occupied until all in-flight requests have finished, so re-registering
+// the same name/address while the old instance is still winding down is
+// rejected instead of creating a duplicate. Re-registration is allowed
+// again once the drain has fully completed.
 func (p *Pool) Register(b *Backend) error {
 	p.mu.Lock()
 	for _, cur := range p.backends {
+		if cur.Name == b.Name || cur.URL.String() == b.URL.String() {
+			p.mu.Unlock()
+			return ErrBackendExists
+		}
+	}
+	for cur := range p.draining {
 		if cur.Name == b.Name || cur.URL.String() == b.URL.String() {
 			p.mu.Unlock()
 			return ErrBackendExists
@@ -145,9 +157,42 @@ func (p *Pool) Deregister(ctx context.Context, b *Backend) error {
 func (p *Pool) finishDrain(b *Backend, h *drainHandle, err error) {
 	p.mu.Lock()
 	delete(p.draining, b)
+	p.retired = append(p.retired, b)
 	h.err = err
 	close(h.done)
 	p.mu.Unlock()
+	// The drain is fully complete: clear the draining flag on the
+	// (now-retired) backend so its final status reads draining=false,
+	// retired=true instead of looking forever mid-drain.
+	b.finishDrain()
+}
+
+// allInstances returns every backend whose counters still contribute to
+// the gateway totals: routable ones, the one currently draining, and
+// fully removed ones. The global totals therefore always equal the sum of
+// the instances reported by this method.
+func (p *Pool) allInstances() []*Backend {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]*Backend, 0, len(p.backends)+len(p.draining)+len(p.retired))
+	out = append(out, p.backends...)
+	for b := range p.draining {
+		out = append(out, b)
+	}
+	out = append(out, p.retired...)
+	return out
+}
+
+// isRetired reports whether b finished draining and was removed.
+func (p *Pool) isRetired(b *Backend) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, cur := range p.retired {
+		if cur == b {
+			return true
+		}
+	}
+	return false
 }
 
 // Snapshot returns a copy of the current backend list.

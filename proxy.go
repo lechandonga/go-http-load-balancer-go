@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -145,24 +146,38 @@ func (lb *LoadBalancer) proxyOnce(ctx context.Context, w http.ResponseWriter, b 
 	if err != nil {
 		cerr := lb.classify(err, r)
 		if !errors.Is(cerr, ErrClientCanceled) {
-			// Client cancellation is not a backend failure signal.
-			recordOutcome(lb.logger, lb.pool.metrics, "passive", b, false, lb.cfg)
-			b.noteFailure(cerr)
-			lb.pool.metrics.noteFailure(cerr)
+			// Client cancellation is not a backend failure signal and
+			// reaches neither the state machine nor any failure counter.
+			recordOutcome(lb.logger, lb.pool.metrics, "passive", b, false, cerr, lb.cfg)
 		}
 		return cerr
 	}
-	defer resp.Body.Close()
-
-	// A received response (even 5xx) is a valid answer: it is forwarded
-	// as-is, and feeds the passive health signal.
-	recordOutcome(lb.logger, lb.pool.metrics, "passive", b, resp.StatusCode < 500, lb.cfg)
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, copyErr := io.Copy(w, resp.Body)
-	if copyErr != nil && r.Context().Err() != nil {
-		return ErrClientCanceled
+	// A truncation announced via Content-Length surfaces only when the
+	// body is closed, so the close error must be inspected explicitly.
+	closeErr := resp.Body.Close()
+
+	// Exactly one observation is recorded for the whole exchange: the
+	// response is forwarded as-is even on 5xx, but a 5xx status or a
+	// truncated body is a bad-response failure feeding the state machine
+	// and the counters once. A 5xx answer never lands in
+	// unreachable/timeout since the connection itself worked.
+	switch {
+	case copyErr != nil || closeErr != nil:
+		if r.Context().Err() != nil {
+			// The downstream client went away mid-body: never counted as
+			// a backend failure.
+			return ErrClientCanceled
+		}
+		recordOutcome(lb.logger, lb.pool.metrics, "passive", b, false, ErrBadResponse, lb.cfg)
+		return ErrBadResponse
+	case resp.StatusCode >= 500:
+		recordOutcome(lb.logger, lb.pool.metrics, "passive", b, false, ErrBadResponse, lb.cfg)
+	default:
+		recordOutcome(lb.logger, lb.pool.metrics, "passive", b, true, nil, lb.cfg)
 	}
 	return nil
 }
@@ -204,7 +219,29 @@ func (lb *LoadBalancer) classify(err error, r *http.Request) error {
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return ErrBadResponse
 	}
+	if isMalformedResponse(err) {
+		// The peer answered with an HTTP response that cannot be parsed:
+		// a bad response, not a reachability problem.
+		return ErrBadResponse
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "read" {
+		// The connection was established and a response was being read
+		// when the peer dropped/reset it: the backend answered badly
+		// rather than being unreachable.
+		return ErrBadResponse
+	}
 	return ErrBackendUnreachable
+}
+
+// isMalformedResponse reports whether err is net/http's text error for
+// an unparseable response. net/http returns these as plain errors (not a
+// sentinel or a typed error), so the stable message prefixes are matched
+// explicitly instead of errors.Is.
+func isMalformedResponse(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "malformed HTTP response") ||
+		strings.Contains(msg, "malformed MIME header")
 }
 
 func copyHeader(dst, src http.Header) {

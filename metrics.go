@@ -7,11 +7,13 @@ import (
 
 // BackendCounters is a consistent snapshot of one backend's counters.
 //
-// Requests counts proxy attempts routed to the backend. Failures counts
-// failure observations fed into the health state machine (active probes and
-// passive results). FailUnreachable/FailTimeout/FailBadResponse classify
-// forwarding failures only, so their sum matches actual failed forwarding
-// attempts. Retries counts extra attempts (beyond the first) routed here.
+// Requests counts proxy attempts routed to the backend (active probes
+// are not requests). Failures counts every failure observation fed into
+// the health state machine — failed forwarding attempts AND failed
+// active probes. FailUnreachable/FailTimeout/FailBadResponse partition
+// those failures (connect failure / timeout / 5xx or malformed
+// response, including probe failures), so Failures always equals their
+// sum. Retries counts extra attempts (beyond the first) routed here.
 // HealthFlips counts healthy<->unhealthy transitions.
 type BackendCounters struct {
 	Requests        int64 `json:"requests"`

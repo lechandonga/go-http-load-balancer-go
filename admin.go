@@ -89,7 +89,7 @@ func (a *AdminHandler) register(w http.ResponseWriter, r *http.Request) {
 	if err := a.pool.Register(b); err != nil {
 		if errors.Is(err, ErrBackendExists) {
 			writeAdminError(w, http.StatusConflict, "duplicate_backend",
-				fmt.Sprintf("name or url already registered: %s", req.URL))
+				fmt.Sprintf("name %q or url %s already registered or still draining; re-register only after the previous instance finished draining", name, req.URL))
 			return
 		}
 		writeAdminError(w, http.StatusInternalServerError, "register_failed", err.Error())

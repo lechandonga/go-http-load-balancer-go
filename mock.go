@@ -120,6 +120,15 @@ func (m *MockBackend) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "down", http.StatusServiceUnavailable)
 		return
 	}
+	if m.injectErr.Load() {
+		// While a 5xx drill is active the whole instance is faulty,
+		// including its health endpoint: active probes must not resurrect
+		// it before the injection is canceled. Cancel the injection and
+		// the probe succeeds again, so recovery uses the normal
+		// consecutive-success threshold.
+		http.Error(w, "injected error", http.StatusInternalServerError)
+		return
+	}
 	fmt.Fprintln(w, "ok")
 }
 

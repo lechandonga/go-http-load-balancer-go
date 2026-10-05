@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,10 @@ func TestMetricsFailureClassification(t *testing.T) {
 	}))
 	t.Cleanup(slow.Close)
 
-	// bad response: sends half a status line then drops the connection
+	// bad response: a complete status line followed by a malformed header
+	// line. The transport deterministically rejects the response while
+	// reading headers (no response is forwarded), which must classify as
+	// bad_response rather than unreachable.
 	truncatedLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +69,7 @@ func TestMetricsFailureClassification(t *testing.T) {
 				return
 			}
 			go func() {
-				conn.Write([]byte("HTTP/1.1 200 O")) // partial status line, then drop
+				io.WriteString(conn, "HTTP/1.1 200 OK\r\nBADHEADER-NO-COLON\r\n\r\n")
 				conn.Close()
 			}()
 		}

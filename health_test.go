@@ -15,7 +15,11 @@ func TestHealthStateMachineThresholds(t *testing.T) {
 
 	step := func(ok bool, wantHealthy bool, wantChanged bool) {
 		t.Helper()
-		changed, healthy := b.recordOutcome(ok, failThresh, recThresh)
+		var failErr error
+		if !ok {
+			failErr = ErrBadResponse
+		}
+		changed, healthy := b.recordOutcome(ok, failErr, failThresh, recThresh)
 		if changed != wantChanged || healthy != wantHealthy {
 			t.Fatalf("recordOutcome(%v) = changed=%v healthy=%v, want changed=%v healthy=%v",
 				ok, changed, healthy, wantChanged, wantHealthy)

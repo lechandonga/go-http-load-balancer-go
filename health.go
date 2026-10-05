@@ -2,16 +2,27 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 )
 
-// recordOutcome feeds one observation into the backend state machine and
-// logs state transitions so flips are visible in logs/metrics.
-func recordOutcome(logger *slog.Logger, metrics *Metrics, source string, b *Backend, ok bool, cfg Config) {
-	changed, healthy := b.recordOutcome(ok, cfg.FailThreshold, cfg.RecoveryThreshold)
+// recordOutcome feeds one observation into the backend state machine.
+// Failed observations (ok == false) must carry failErr, the classified
+// failure sentinel. The per-backend aggregate and category counters are
+// bumped atomically inside the backend's state-machine critical section;
+// the global totals are bumped here at the same call, so per-backend and
+// global counters can never drift apart.
+func recordOutcome(logger *slog.Logger, metrics *Metrics, source string, b *Backend, ok bool, failErr error, cfg Config) {
+	if !ok && failErr != nil {
+		if metrics != nil {
+			metrics.noteFailure(failErr)
+		}
+	}
+	changed, healthy := b.recordOutcome(ok, failErr, cfg.FailThreshold, cfg.RecoveryThreshold)
 	if changed {
 		if metrics != nil {
 			metrics.noteHealthFlip()
@@ -101,14 +112,32 @@ func (hc *HealthChecker) probe(b *Backend) {
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, ErrBackendUnreachable, hc.cfg)
 		return
 	}
 	resp, err := hc.client.Do(req)
 	if err != nil {
-		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, hc.cfg)
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, classifyProbeError(err), hc.cfg)
 		return
 	}
 	defer resp.Body.Close()
-	recordOutcome(hc.logger, hc.pool.metrics, "active", b, resp.StatusCode < 500, hc.cfg)
+	if resp.StatusCode < 500 {
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, true, nil, hc.cfg)
+	} else {
+		recordOutcome(hc.logger, hc.pool.metrics, "active", b, false, ErrBadResponse, hc.cfg)
+	}
+}
+
+// classifyProbeError maps a probe transport error to the shared failure
+// taxonomy: a failed probe is a real failure observation and must land in
+// a stable, scriptable category (unreachable / timeout), never in limbo.
+func classifyProbeError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return ErrBackendTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ErrBackendTimeout
+	}
+	return ErrBackendUnreachable
 }

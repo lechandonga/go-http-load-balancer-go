@@ -84,6 +84,14 @@ func (b *Backend) waitDrain() {
 	b.inflight.Wait()
 }
 
+// finishDrain clears the draining flag after the drain has fully
+// completed and the backend has been retired.
+func (b *Backend) finishDrain() {
+	b.mu.Lock()
+	b.draining = false
+	b.mu.Unlock()
+}
+
 // Draining reports whether deregistration has begun.
 func (b *Backend) Draining() bool {
 	b.mu.Lock()
@@ -108,19 +116,6 @@ func (b *Backend) Stats() (requests, failures int64) {
 	return b.totalReqs.Load(), b.totalFails.Load()
 }
 
-// noteFailure records one classified forwarding failure. Client
-// cancellation never reaches this path.
-func (b *Backend) noteFailure(err error) {
-	switch {
-	case errors.Is(err, ErrBackendTimeout):
-		b.failTimeout.Add(1)
-	case errors.Is(err, ErrBadResponse):
-		b.failBadResponse.Add(1)
-	default:
-		b.failUnreachable.Add(1)
-	}
-}
-
 // noteRetry records one extra attempt (beyond the first) routed to b.
 func (b *Backend) noteRetry() {
 	b.retryCount.Add(1)
@@ -140,11 +135,16 @@ func (b *Backend) Counters() BackendCounters {
 }
 
 // recordOutcome feeds one observation (active probe or real request) into
-// the health state machine. It returns true only when the state flipped.
+// the health state machine. A failed observation must carry failErr, the
+// classified failure sentinel: its aggregate failure counter and exactly
+// one classification counter are bumped inside the same critical section
+// as the state-machine update, so concurrent observations can never make
+// the counters disagree with what entered the state machine. It returns
+// true only when the state flipped.
 //
 // The consecutive counters are the anti-flapping mechanism: a single
 // outlier resets the opposite counter but cannot switch the state.
-func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (changed bool, healthy bool) {
+func (b *Backend) recordOutcome(ok bool, failErr error, failThreshold, recoveryThreshold int) (changed bool, healthy bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if ok {
@@ -160,6 +160,14 @@ func (b *Backend) recordOutcome(ok bool, failThreshold, recoveryThreshold int) (
 	b.consecFail++
 	b.consecOK = 0
 	b.totalFails.Add(1)
+	switch {
+	case errors.Is(failErr, ErrBackendTimeout):
+		b.failTimeout.Add(1)
+	case errors.Is(failErr, ErrBadResponse):
+		b.failBadResponse.Add(1)
+	default:
+		b.failUnreachable.Add(1)
+	}
 	if b.healthy && b.consecFail >= failThreshold {
 		b.healthy = false
 		b.healthFlips.Add(1)
